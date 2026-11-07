@@ -1,0 +1,664 @@
+#include <Arduino.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include "esp_wifi.h"
+
+// =====================================================
+// WIFI CONFIG
+// =====================================================
+const char* ssid = "Robot_Resource (Lokal)";
+const char* password = "robot@9876";
+
+// =====================================================
+// MQTT CONFIG
+// Samakan dengan broker Node-RED
+// =====================================================
+const char* mqtt_server = "10.5.0.106";
+const int mqtt_port = 1883;
+
+// =====================================================
+// DEVICE TYPE
+// KHUSUS ALAT OUT
+// =====================================================
+const char* SCAN_TYPE = "in";
+
+// =====================================================
+// PIN CONFIG
+// =====================================================
+#define RFID_RX_PIN 16
+#define RFID_TX_PIN 17
+
+#define BUTTON_PIN 15
+
+// Passive buzzer
+#define BUZZER_PIN 25
+
+// =====================================================
+// LCD CONFIG
+// =====================================================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// =====================================================
+// OBJECT
+// =====================================================
+WiFiClient espClient;
+PubSubClient client(espClient);
+HardwareSerial RFID(2);
+
+// =====================================================
+// MQTT TOPIC
+// =====================================================
+String deviceId;
+String topicPublish;
+String topicReply;
+String topicStatus;
+
+// =====================================================
+// LCD STATE
+// =====================================================
+bool hasLoginDisplay = false;
+String lastLoginLine1 = "";
+String lastLoginLine2 = "";
+
+bool temporaryScreen = false;
+unsigned long screenExpireAt = 0;
+
+// =====================================================
+// RFID STATE
+// =====================================================
+bool waitingReply = false;
+unsigned long waitingReplyStart = 0;
+const unsigned long replyTimeout = 6000;
+
+// =====================================================
+// RFID DEBOUNCE
+// =====================================================
+String lastTag = "";
+unsigned long lastReadTime = 0;
+const unsigned long debounceTime = 1500;
+
+// =====================================================
+// BUTTON DEBOUNCE
+// =====================================================
+bool lastButtonReading = HIGH;
+bool buttonState = HIGH;
+unsigned long lastButtonDebounceTime = 0;
+const unsigned long buttonDebounceDelay = 50;
+
+// =====================================================
+// HEARTBEAT
+// =====================================================
+unsigned long lastHeartbeat = 0;
+const unsigned long heartbeatInterval = 5000;
+
+// =====================================================
+// DEBUG
+// =====================================================
+bool debugMode = true;
+
+void debugPrint(String msg)
+{
+  if (debugMode)
+  {
+    Serial.println(msg);
+  }
+}
+
+// =====================================================
+// PASSIVE BUZZER TANPA tone() / TANPA ledc
+// Aman untuk berbagai versi ESP32 board
+// =====================================================
+void buzzerTone(int frequency, int durationMs)
+{
+  if (frequency <= 0 || durationMs <= 0)
+    return;
+
+  unsigned long periodUs = 1000000UL / frequency;
+  unsigned long halfPeriodUs = periodUs / 2;
+  unsigned long cycles = ((unsigned long)frequency * durationMs) / 1000UL;
+
+  for (unsigned long i = 0; i < cycles; i++)
+  {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delayMicroseconds(halfPeriodUs);
+    digitalWrite(BUZZER_PIN, LOW);
+    delayMicroseconds(halfPeriodUs);
+  }
+
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+void beepOnce(int duration = 120)
+{
+  buzzerTone(2500, duration);
+}
+
+void beepCount(int count)
+{
+  if (count <= 0)
+    return;
+
+  if (count > 5)
+    count = 5;
+
+  for (int i = 0; i < count; i++)
+  {
+    beepOnce(120);
+    delay(100);
+  }
+}
+
+// =====================================================
+// LCD HELPER
+// =====================================================
+String fit16(String text)
+{
+  text.trim();
+
+  if (text.length() > 16)
+  {
+    text = text.substring(0, 16);
+  }
+
+  return text;
+}
+
+void lcdPrint16(int col, int row, String text)
+{
+  lcd.setCursor(col, row);
+
+  text = fit16(text);
+  lcd.print(text);
+
+  for (int i = text.length(); i < 16; i++)
+  {
+    lcd.print(" ");
+  }
+}
+
+void showLCD(String row1, String row2)
+{
+  lcd.clear();
+  lcdPrint16(0, 0, row1);
+  lcdPrint16(0, 1, row2);
+}
+
+void showStandby()
+{
+  hasLoginDisplay = false;
+  lastLoginLine1 = "";
+  lastLoginLine2 = "";
+  temporaryScreen = false;
+
+  showLCD("TAP RFID | IN", "PLEASE SCAN");
+}
+
+void showLastLoginOrStandby()
+{
+  if (hasLoginDisplay)
+  {
+    showLCD(lastLoginLine1, lastLoginLine2);
+  }
+  else
+  {
+    showStandby();
+  }
+}
+
+// =====================================================
+// PARSER REPLY MQTT
+// Format reply Node-RED:
+// MODE^BEEP^LCD1^LCD2
+// =====================================================
+String getPart(String data, char separator, int index)
+{
+  int found = 0;
+  int startIndex = 0;
+
+  for (int i = 0; i <= data.length(); i++)
+  {
+    if (i == data.length() || data.charAt(i) == separator)
+    {
+      if (found == index)
+      {
+        return data.substring(startIndex, i);
+      }
+
+      found++;
+      startIndex = i + 1;
+    }
+  }
+
+  return "";
+}
+
+// =====================================================
+// RFID READER
+// Reader format: STX 0x02 ... ETX 0x03
+// Output RFID decimal 10 digit
+// =====================================================
+String readTag(Stream& serial)
+{
+  if (!serial.available())
+    return "";
+
+  if (serial.read() != 0x02)
+    return "";
+
+  String hexData = "";
+  unsigned long start = millis();
+
+  while (millis() - start < 100)
+  {
+    if (serial.available())
+    {
+      char c = serial.read();
+
+      if (c == 0x03)
+        break;
+
+      hexData += c;
+    }
+  }
+
+  if (hexData.length() < 12)
+    return "";
+
+  String tagHex = hexData.substring(0, 10);
+  String serialHex = tagHex.substring(2, 10);
+
+  uint64_t tagDec = strtoull(serialHex.c_str(), NULL, 16);
+
+  char buffer[20];
+
+  snprintf(
+    buffer,
+    sizeof(buffer),
+    "%010llu",
+    (unsigned long long)tagDec
+  );
+
+  return String(buffer);
+}
+
+// =====================================================
+// RFID CONTROL
+// =====================================================
+bool allowRFID(String tag)
+{
+  unsigned long now = millis();
+
+  if (waitingReply)
+  {
+    debugPrint("RFID ignored, waiting reply: " + tag);
+    return false;
+  }
+
+  if (tag == lastTag && now - lastReadTime < debounceTime)
+  {
+    lastReadTime = now;
+    debugPrint("RFID duplicate ignored: " + tag);
+    return false;
+  }
+
+  lastTag = tag;
+  lastReadTime = now;
+
+  return true;
+}
+
+// =====================================================
+// SEND RFID TO MQTT
+// Payload:
+// MAC/RFID/in
+// =====================================================
+void sendRfid(String tag)
+{
+  if (!client.connected())
+  {
+    showLCD("MQTT OFFLINE", "RECONNECT...");
+    beepCount(3);
+    waitingReply = false;
+
+    temporaryScreen = true;
+    screenExpireAt = millis() + 3000;
+    return;
+  }
+
+  String payload = "";
+  payload += deviceId;
+  payload += "/";
+  payload += tag;
+  payload += "/";
+  payload += SCAN_TYPE;
+
+  debugPrint("Publish topic: " + topicPublish);
+  debugPrint("Publish data : " + payload);
+
+  bool ok = client.publish(topicPublish.c_str(), payload.c_str());
+
+  if (!ok)
+  {
+    showLCD("MQTT SEND FAIL", "CHECK BROKER");
+    beepCount(3);
+
+    temporaryScreen = true;
+    screenExpireAt = millis() + 3000;
+    return;
+  }
+
+  waitingReply = true;
+  waitingReplyStart = millis();
+
+  showLCD("PROCESSING", tag);
+  beepOnce(120);
+}
+
+// =====================================================
+// MQTT CALLBACK
+// =====================================================
+void callback(char* topic, byte* payload, unsigned int length)
+{
+  String msg = "";
+
+  for (unsigned int i = 0; i < length; i++)
+  {
+    msg += (char)payload[i];
+  }
+
+  msg.trim();
+
+  debugPrint("RX TOPIC: " + String(topic));
+  debugPrint("RX MSG  : " + msg);
+
+  waitingReply = false;
+
+  String mode = getPart(msg, '^', 0);
+  String beepText = getPart(msg, '^', 1);
+  String lcd1 = getPart(msg, '^', 2);
+  String lcd2 = getPart(msg, '^', 3);
+
+  if (mode.length() == 0)
+  {
+    showLCD("BAD RESPONSE", "CHECK MQTT");
+    beepCount(3);
+
+    temporaryScreen = true;
+    screenExpireAt = millis() + 3000;
+    return;
+  }
+
+  int beepQty = beepText.toInt();
+
+  if (beepQty < 0)
+    beepQty = 0;
+
+  if (beepQty > 5)
+    beepQty = 5;
+
+  showLCD(lcd1, lcd2);
+  beepCount(beepQty);
+
+  // LOGIN / SWITCH OPERATOR
+  if (mode == "LOGIN_OK")
+  {
+    hasLoginDisplay = true;
+    lastLoginLine1 = lcd1;
+    lastLoginLine2 = lcd2;
+    temporaryScreen = false;
+    return;
+  }
+
+  // LOGOUT / NO SESSION
+  if (mode == "LOGOUT" || mode == "NO_SESSION")
+  {
+    hasLoginDisplay = false;
+    lastLoginLine1 = "";
+    lastLoginLine2 = "";
+
+    temporaryScreen = true;
+    screenExpireAt = millis() + 1500;
+    return;
+  }
+
+  // SCAN_OK / IN OK / ALREADY_IN / ERROR
+  // Tampil sementara lalu kembali ke tampilan user login
+  temporaryScreen = true;
+  screenExpireAt = millis() + 3000;
+}
+
+// =====================================================
+// WIFI CONNECT
+// =====================================================
+void connectWiFi()
+{
+  showLCD("CONNECT WIFI", ssid);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  WiFi.setSleep(false);
+
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  esp_wifi_set_protocol(
+    WIFI_IF_STA,
+    WIFI_PROTOCOL_11B
+  );
+
+  esp_wifi_set_bandwidth(
+    WIFI_IF_STA,
+    WIFI_BW_HT20
+  );
+
+  showLCD("WIFI CONNECTED", WiFi.localIP().toString());
+  delay(1000);
+}
+
+// =====================================================
+// MQTT RECONNECT
+// =====================================================
+void reconnectMQTT()
+{
+  while (!client.connected())
+  {
+    debugPrint("Connecting MQTT...");
+
+    showLCD("MQTT CONNECT TO", mqtt_server);
+
+    String clientId = "ESP32-IN-" + deviceId;
+
+    if (
+      client.connect(
+        clientId.c_str(),
+        topicStatus.c_str(),
+        0,
+        true,
+        "offline"
+      )
+    )
+    {
+      debugPrint("MQTT Connected");
+
+      client.subscribe(topicReply.c_str());
+
+      client.publish(
+        topicStatus.c_str(),
+        "online",
+        true
+      );
+
+      showLCD("MQTT SUCCESS", mqtt_server);
+      delay(700);
+
+      showLastLoginOrStandby();
+    }
+    else
+    {
+      debugPrint("MQTT Failed");
+      showLCD("MQTT FAILED", "RETRY...");
+      delay(2000);
+    }
+  }
+}
+
+// =====================================================
+// BUTTON
+// =====================================================
+void handleButton()
+{
+  bool reading = digitalRead(BUTTON_PIN);
+
+  if (reading != lastButtonReading)
+  {
+    lastButtonDebounceTime = millis();
+  }
+
+  if ((millis() - lastButtonDebounceTime) > buttonDebounceDelay)
+  {
+    if (reading != buttonState)
+    {
+      buttonState = reading;
+
+      if (buttonState == LOW)
+      {
+        debugPrint("BUTTON GPIO15 PRESSED");
+
+        showLCD("BELUM DIPROGRAM", "BANGG~~~");
+        beepCount(2);
+
+        temporaryScreen = true;
+        screenExpireAt = millis() + 2500;
+      }
+    }
+  }
+
+  lastButtonReading = reading;
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  RFID.begin(
+    9600,
+    SERIAL_8N1,
+    RFID_RX_PIN,
+    RFID_TX_PIN
+  );
+
+  lcd.init();
+  lcd.backlight();
+
+  showLCD("RFID IN READY", "STARTING...");
+  delay(1000);
+
+  connectWiFi();
+
+  deviceId = WiFi.macAddress();
+  deviceId.replace(":", "");
+  deviceId.toUpperCase();
+
+  topicPublish = "rfid/batch/in/";
+  topicPublish += deviceId;
+
+  topicReply = "rfid/batch/reply/";
+  topicReply += deviceId;
+
+  topicStatus = "rfid/batch/status/";
+  topicStatus += deviceId;
+
+  debugPrint("Device ID    : " + deviceId);
+  debugPrint("topicPublish : " + topicPublish);
+  debugPrint("topicReply   : " + topicReply);
+  debugPrint("topicStatus  : " + topicStatus);
+
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+  client.setBufferSize(512);
+
+  reconnectMQTT();
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop()
+{
+  handleButton();
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    waitingReply = false;
+    showLCD("WIFI LOST", "RECONNECT...");
+    WiFi.reconnect();
+    delay(1000);
+    return;
+  }
+
+  if (!client.connected())
+  {
+    waitingReply = false;
+    reconnectMQTT();
+  }
+
+  client.loop();
+
+  // Jika Node-RED/PHP tidak membalas
+  if (waitingReply && millis() - waitingReplyStart >= replyTimeout)
+  {
+    waitingReply = false;
+
+    showLCD("NO REPLY", "CHECK SERVER");
+    beepCount(3);
+
+    temporaryScreen = true;
+    screenExpireAt = millis() + 3000;
+  }
+
+  // Setelah screen sementara selesai, kembali ke login display / standby
+  if (temporaryScreen && millis() >= screenExpireAt)
+  {
+    temporaryScreen = false;
+    showLastLoginOrStandby();
+  }
+
+  // Heartbeat status alat
+  if (millis() - lastHeartbeat >= heartbeatInterval)
+  {
+    lastHeartbeat = millis();
+
+    client.publish(
+      topicStatus.c_str(),
+      "online",
+      true
+    );
+  }
+
+  // Baca RFID
+  String tag = readTag(RFID);
+
+  if (tag.length() > 0)
+  {
+    if (!allowRFID(tag))
+    {
+      return;
+    }
+
+    sendRfid(tag);
+  }
+}

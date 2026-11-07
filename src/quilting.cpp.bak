@@ -1,0 +1,2611 @@
+#include <Arduino.h>
+#include <LiquidCrystal_I2C.h>
+#include <PubSubClient.h>
+#include <WiFi.h>
+#include <ArduinoJson.h>
+
+#include "esp_bt.h"
+#include "esp_wifi.h"
+#include "esp_system.h"
+
+#if __has_include(<esp_arduino_version.h>)
+#include <esp_arduino_version.h>
+#endif
+
+#if __has_include("esp_mac.h")
+#include "esp_mac.h"
+#endif
+
+// =====================================================
+// KONFIGURASI ALAT
+// =====================================================
+//
+// DEVICE_TYPE:
+// - "in"
+// - "out"
+//
+// DEVICE_BAGIAN:
+// - "quilting"
+// - "downfilling"
+//
+// Hasil scan_type:
+// - in_quilting
+// - out_quilting
+// - in_downfilling
+// - out_downfilling
+// =====================================================
+const char* DEVICE_TYPE   = "in";
+const char* DEVICE_BAGIAN = "downfilling";
+
+// =====================================================
+// WIFI
+// =====================================================
+const char* WIFI_SSID = "Tracked (9)";
+const char* WIFI_PASS = "Factory@RFID";
+// const char* WIFI_SSID = "GM3_RFID";
+// const char* WIFI_PASS = "Factory@RFID";
+
+// =====================================================
+// MQTT
+// =====================================================
+const char* MQTT_SERVER = "10.5.2.223";
+const uint16_t MQTT_PORT = 1883;
+
+// =====================================================
+// TOPIK MQTT
+// =====================================================
+const char* TOPIC_REQUEST = "quiltdown/request";
+
+String topicResponse;
+String topicStatus;
+String topicReset;
+
+// =====================================================
+// RFID UART RDM6300
+// =====================================================
+constexpr uint8_t RFID_RX_PIN = 16;
+constexpr uint8_t RFID_TX_PIN = 17;
+constexpr uint32_t RFID_BAUD  = 9600;
+
+// =====================================================
+// LCD
+// =====================================================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// =====================================================
+// BUZZER
+// =====================================================
+constexpr uint8_t BUZZER_PIN        = 25;
+constexpr uint8_t BUZZER_CHANNEL    = 0;
+constexpr uint16_t BUZZER_FREQUENCY = 2000;
+constexpr uint8_t BUZZER_RESOLUTION = 8;
+
+// =====================================================
+// TOMBOL
+//
+// Wiring:
+// GPIO 15 -> tombol -> GND
+// =====================================================
+constexpr uint8_t BUTTON_PIN = 15;
+
+constexpr unsigned long BUTTON_DEBOUNCE_MS     = 80;
+constexpr unsigned long BUTTON_REPEAT_BLOCK_MS = 700;
+
+// =====================================================
+// INTERVAL
+// =====================================================
+constexpr unsigned long WIFI_RETRY_INTERVAL = 10000;
+constexpr unsigned long MQTT_RETRY_INTERVAL = 5000;
+constexpr unsigned long HEARTBEAT_INTERVAL  = 5000;
+
+constexpr unsigned long RFID_DEBOUNCE_TIME       = 2000;
+constexpr unsigned long RFID_PROCESSING_TIMEOUT  = 8000;
+constexpr unsigned long RESTORE_TIMEOUT          = 8000;
+constexpr unsigned long READY_RETURN_DELAY       = 1800;
+
+// =====================================================
+// OBJECT
+// =====================================================
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+HardwareSerial RFID(2);
+
+// =====================================================
+// IDENTITAS ALAT
+// =====================================================
+String deviceId       = "";
+String scanType       = "";
+String bootResetReason = "";
+
+// =====================================================
+// SESSION OPERATOR
+// =====================================================
+bool operatorLoggedIn = false;
+
+String activeOperatorRfid = "";
+String operatorName       = "NO LOGIN";
+String operatorLine       = "";
+
+// =====================================================
+// MODE INPUT
+// =====================================================
+enum InputMode
+{
+  MODE_GOOD,
+  MODE_REWORK,
+  MODE_REJECT
+};
+
+InputMode inputMode = MODE_GOOD;
+
+// =====================================================
+// COUNTER
+// =====================================================
+long totalGood   = 0;
+long totalRework = 0;
+long totalReject = 0;
+
+// =====================================================
+// RFID STATE
+// =====================================================
+String lastTag = "";
+unsigned long lastReadTime = 0;
+
+bool rfidProcessing = false;
+unsigned long rfidProcessingStart = 0;
+
+String lastRequestId = "";
+
+// =====================================================
+// RESTORE SESSION STATE
+// =====================================================
+bool restoreRequested = false;
+bool restoreCompleted = false;
+
+unsigned long restoreRequestAt = 0;
+
+// =====================================================
+// CONNECTION STATE
+// =====================================================
+unsigned long lastWifiAttempt = 0;
+unsigned long lastMqttAttempt = 0;
+unsigned long lastHeartbeat   = 0;
+
+bool wifiWasConnected = false;
+bool mqttWasConnected = false;
+
+// =====================================================
+// READY SCREEN STATE
+// =====================================================
+bool returnToReady = false;
+unsigned long returnReadyStart = 0;
+
+// =====================================================
+// BUTTON STATE
+// =====================================================
+bool lastButtonReading = HIGH;
+bool stableButtonState = HIGH;
+
+unsigned long buttonChangedAt    = 0;
+unsigned long lastButtonActionAt = 0;
+
+// =====================================================
+// DEBUG
+// =====================================================
+bool debugMode = true;
+
+// =====================================================
+// PROTOTYPE
+// =====================================================
+void showReady();
+void scheduleReady();
+void handleButton();
+void haltInvalidMac();
+bool requestRestoreSession();
+
+// =====================================================
+// DEBUG PRINT
+// =====================================================
+void debugPrint(const String& message)
+{
+  if (debugMode)
+  {
+    Serial.println(message);
+  }
+}
+
+// =====================================================
+// LCD
+// =====================================================
+void lcdPrint16(uint8_t row, String text)
+{
+  if (text.length() > 16)
+  {
+    text = text.substring(0, 16);
+  }
+
+  lcd.setCursor(0, row);
+  lcd.print(text);
+
+  for (int i = text.length(); i < 16; i++)
+  {
+    lcd.print(' ');
+  }
+}
+
+void showMessage(
+    const String& row1,
+    const String& row2 = ""
+)
+{
+  lcdPrint16(0, row1);
+  lcdPrint16(1, row2);
+}
+
+// =====================================================
+// BUZZER
+// =====================================================
+void buzzerBegin()
+{
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+
+  ledcAttach(
+      BUZZER_PIN,
+      BUZZER_FREQUENCY,
+      BUZZER_RESOLUTION
+  );
+
+  ledcWriteTone(
+      BUZZER_PIN,
+      0
+  );
+
+#else
+
+  ledcSetup(
+      BUZZER_CHANNEL,
+      BUZZER_FREQUENCY,
+      BUZZER_RESOLUTION
+  );
+
+  ledcAttachPin(
+      BUZZER_PIN,
+      BUZZER_CHANNEL
+  );
+
+  ledcWriteTone(
+      BUZZER_CHANNEL,
+      0
+  );
+
+#endif
+}
+
+void buzzerTone(int frequency)
+{
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+
+  ledcWriteTone(
+      BUZZER_PIN,
+      frequency
+  );
+
+#else
+
+  ledcWriteTone(
+      BUZZER_CHANNEL,
+      frequency
+  );
+
+#endif
+}
+
+void buzzerOff()
+{
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+
+  ledcWriteTone(
+      BUZZER_PIN,
+      0
+  );
+
+#else
+
+  ledcWriteTone(
+      BUZZER_CHANNEL,
+      0
+  );
+
+#endif
+}
+
+void beep(
+    int duration = 120,
+    int frequency = 2200
+)
+{
+  if (duration <= 0)
+  {
+    return;
+  }
+
+  buzzerTone(frequency);
+  delay(duration);
+  buzzerOff();
+}
+
+void beepCode(int code)
+{
+  if (code <= 0)
+  {
+    return;
+  }
+
+  if (code == 1)
+  {
+    beep(120, 2200);
+    return;
+  }
+
+  if (code == 2)
+  {
+    beep(100, 2200);
+    delay(70);
+    beep(100, 2200);
+    return;
+  }
+
+  beep(450, 900);
+}
+
+// =====================================================
+// RESET REASON
+// =====================================================
+String resetReasonText(esp_reset_reason_t reason)
+{
+  switch (reason)
+  {
+    case ESP_RST_UNKNOWN:
+      return "UNKNOWN";
+
+    case ESP_RST_POWERON:
+      return "POWER ON";
+
+    case ESP_RST_EXT:
+      return "EXT RESET";
+
+    case ESP_RST_SW:
+      return "SOFTWARE RESET";
+
+    case ESP_RST_PANIC:
+      return "PANIC CRASH";
+
+    case ESP_RST_INT_WDT:
+      return "INT WDT";
+
+    case ESP_RST_TASK_WDT:
+      return "TASK WDT";
+
+    case ESP_RST_WDT:
+      return "OTHER WDT";
+
+    case ESP_RST_DEEPSLEEP:
+      return "DEEP SLEEP";
+
+    case ESP_RST_BROWNOUT:
+      return "BROWNOUT";
+
+    case ESP_RST_SDIO:
+      return "SDIO RESET";
+
+    default:
+      return "RESET " + String((int)reason);
+  }
+}
+
+String esp_rst()
+{
+  return resetReasonText(
+      esp_reset_reason()
+  );
+}
+
+// =====================================================
+// NORMALISASI MAC
+// =====================================================
+String normalizeMac(String mac)
+{
+  mac.trim();
+
+  mac.replace(":", "");
+  mac.replace("-", "");
+  mac.replace(" ", "");
+
+  mac.toUpperCase();
+
+  return mac;
+}
+
+// =====================================================
+// VALIDASI HEXADECIMAL
+// =====================================================
+bool isHexChar(char value)
+{
+  return (
+      (value >= '0' && value <= '9') ||
+      (value >= 'A' && value <= 'F')
+  );
+}
+
+// =====================================================
+// VALIDASI MAC
+// =====================================================
+bool isInvalidMac(String mac)
+{
+  mac = normalizeMac(mac);
+
+  if (mac.length() != 12)
+  {
+    return true;
+  }
+
+  if (
+      mac == "000000000000" ||
+      mac == "FFFFFFFFFFFF" ||
+      mac == "INVALID_MAC"
+  )
+  {
+    return true;
+  }
+
+  for (int i = 0; i < mac.length(); i++)
+  {
+    if (!isHexChar(mac.charAt(i)))
+    {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// =====================================================
+// KONVERSI BYTE MAC MENJADI STRING
+// =====================================================
+String macFromBytes(const uint8_t mac[6])
+{
+  char buffer[13];
+
+  snprintf(
+      buffer,
+      sizeof(buffer),
+      "%02X%02X%02X%02X%02X%02X",
+      mac[0],
+      mac[1],
+      mac[2],
+      mac[3],
+      mac[4],
+      mac[5]
+  );
+
+  return String(buffer);
+}
+
+// =====================================================
+// AMBIL MAC AMAN
+// =====================================================
+String getSafeMacAddress()
+{
+  String mac = "";
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+
+  delay(200);
+
+  for (int attempt = 0; attempt < 20; attempt++)
+  {
+    uint8_t macBytes[6] = {
+        0, 0, 0, 0, 0, 0
+    };
+
+    // =================================================
+    // CARA 1: esp_wifi_get_mac
+    // =================================================
+    esp_err_t wifiMacResult =
+        esp_wifi_get_mac(
+            WIFI_IF_STA,
+            macBytes
+        );
+
+    if (wifiMacResult == ESP_OK)
+    {
+      mac = normalizeMac(
+          macFromBytes(macBytes)
+      );
+
+      if (!isInvalidMac(mac))
+      {
+        debugPrint(
+            "MAC esp_wifi_get_mac: " +
+            mac
+        );
+
+        return mac;
+      }
+    }
+
+    // =================================================
+    // CARA 2: esp_read_mac
+    // =================================================
+#if defined(ESP_MAC_WIFI_STA)
+
+    esp_read_mac(
+        macBytes,
+        ESP_MAC_WIFI_STA
+    );
+
+    mac = normalizeMac(
+        macFromBytes(macBytes)
+    );
+
+    if (!isInvalidMac(mac))
+    {
+      debugPrint(
+          "MAC esp_read_mac: " +
+          mac
+      );
+
+      return mac;
+    }
+
+#endif
+
+    // =================================================
+    // CARA 3: WiFi.macAddress
+    // =================================================
+    mac = normalizeMac(
+        WiFi.macAddress()
+    );
+
+    if (!isInvalidMac(mac))
+    {
+      debugPrint(
+          "MAC WiFi.macAddress: " +
+          mac
+      );
+
+      return mac;
+    }
+
+    debugPrint(
+        "MAC invalid retry " +
+        String(attempt + 1) +
+        ": " +
+        mac
+    );
+
+    delay(250);
+  }
+
+  return "INVALID_MAC";
+}
+
+String macForDisplay()
+{
+  String mac = normalizeMac(deviceId);
+
+  if (mac.length() == 12)
+  {
+    return mac;
+  }
+
+  return "MAC INVALID";
+}
+
+// =====================================================
+// RESET DEBUG
+// =====================================================
+void printResetDebug()
+{
+  Serial.println();
+  Serial.println(
+      "========== ESP32 RESET DEBUG =========="
+  );
+
+  Serial.println(
+      "Reset Reason : " +
+      bootResetReason
+  );
+
+  Serial.println(
+      "Device MAC   : " +
+      deviceId
+  );
+
+  Serial.println(
+      "Device Type  : " +
+      String(DEVICE_TYPE)
+  );
+
+  Serial.println(
+      "Bagian       : " +
+      String(DEVICE_BAGIAN)
+  );
+
+  Serial.println(
+      "Scan Type    : " +
+      scanType
+  );
+
+  Serial.println(
+      "Free Heap    : " +
+      String(ESP.getFreeHeap())
+  );
+
+  Serial.println(
+      "Sketch Size  : " +
+      String(ESP.getSketchSize())
+  );
+
+  Serial.println(
+      "Flash Size   : " +
+      String(ESP.getFlashChipSize())
+  );
+
+  Serial.println(
+      "CPU Freq MHz : " +
+      String(ESP.getCpuFreqMHz())
+  );
+
+  Serial.println(
+      "======================================="
+  );
+
+  Serial.println();
+}
+
+// =====================================================
+// TAMPILKAN RESET REASON
+// =====================================================
+void showResetReasonOnLCD()
+{
+  showMessage(
+      "RST:" + bootResetReason,
+      "BOOTING..."
+  );
+
+  delay(1000);
+}
+
+// =====================================================
+// VALIDASI KONFIGURASI
+// =====================================================
+bool validDeviceConfig()
+{
+  String type = String(DEVICE_TYPE);
+  String bagian = String(DEVICE_BAGIAN);
+
+  type.trim();
+  type.toLowerCase();
+
+  bagian.trim();
+  bagian.toLowerCase();
+
+  bool typeValid =
+      type == "in" ||
+      type == "out";
+
+  bool bagianValid =
+      bagian == "quilting" ||
+      bagian == "downfilling";
+
+  return typeValid && bagianValid;
+}
+
+// =====================================================
+// BUILD SCAN TYPE
+// =====================================================
+String buildScanType()
+{
+  String type = String(DEVICE_TYPE);
+  String bagian = String(DEVICE_BAGIAN);
+
+  type.trim();
+  type.toLowerCase();
+
+  bagian.trim();
+  bagian.toLowerCase();
+
+  return type + "_" + bagian;
+}
+
+// =====================================================
+// MODE INPUT
+// =====================================================
+String inputModeText()
+{
+  switch (inputMode)
+  {
+    case MODE_GOOD:
+      return "GOOD";
+
+    case MODE_REWORK:
+      return "REWORK";
+
+    case MODE_REJECT:
+      return "REJECT";
+
+    default:
+      return "GOOD";
+  }
+}
+
+long activeModeTotal()
+{
+  switch (inputMode)
+  {
+    case MODE_GOOD:
+      return totalGood;
+
+    case MODE_REWORK:
+      return totalRework;
+
+    case MODE_REJECT:
+      return totalReject;
+
+    default:
+      return totalGood;
+  }
+}
+
+// =====================================================
+// POTONG NAMA OPERATOR
+// =====================================================
+String shortOperatorName(
+    String name,
+    int maxLength
+)
+{
+  name.trim();
+  name.toUpperCase();
+
+  if (name.length() == 0)
+  {
+    return "NO LOGIN";
+  }
+
+  if (name.length() > maxLength)
+  {
+    return name.substring(0, maxLength);
+  }
+
+  return name;
+}
+
+// =====================================================
+// TAMPILAN IDLE
+// =====================================================
+void showReady()
+{
+  if (!operatorLoggedIn)
+  {
+    showMessage(
+        "NO LOGIN",
+        "TAP KARTU USER"
+    );
+
+    return;
+  }
+
+  String lineText = operatorLine;
+  lineText.trim();
+
+  if (lineText.length() == 0)
+  {
+    lineText = "0";
+  }
+
+  // ===================================================
+  // BARIS 1
+  // Contoh: L1 | RANGGA
+  // ===================================================
+  String row1Prefix =
+      "L" +
+      lineText +
+      " | ";
+
+  int availableNameLength =
+      16 - row1Prefix.length();
+
+  if (availableNameLength < 1)
+  {
+    availableNameLength = 1;
+  }
+
+  String row1 =
+      row1Prefix +
+      shortOperatorName(
+          operatorName,
+          availableNameLength
+      );
+
+  // ===================================================
+  // BARIS 2
+  // Contoh:
+  // IN | GOOD = 5
+  // IN | REWORK = 4
+  // IN | REJECT = 2
+  // ===================================================
+  String typeText = String(DEVICE_TYPE);
+
+  typeText.trim();
+  typeText.toUpperCase();
+
+  String row2 =
+      typeText +
+      " | " +
+      inputModeText() +
+      " = " +
+      String(activeModeTotal());
+
+  lcdPrint16(0, row1);
+  lcdPrint16(1, row2);
+}
+
+// =====================================================
+// KEMBALI KE IDLE
+// =====================================================
+void scheduleReady()
+{
+  returnToReady = true;
+  returnReadyStart = millis();
+}
+
+// =====================================================
+// TAMPILKAN MAC DAN RESTART
+// =====================================================
+void displayMacAndRestart()
+{
+  rfidProcessing = false;
+  restoreRequested = false;
+  returnToReady = false;
+
+  showMessage(
+      "DEVICE MAC:",
+      macForDisplay()
+  );
+
+  beepCode(1);
+
+  delay(3000);
+
+  showMessage(
+      "RESTART ESP32",
+      "PLEASE WAIT"
+  );
+
+  beepCode(2);
+
+  delay(500);
+
+  Serial.println(
+      "Menjalankan ESP.restart()"
+  );
+
+  Serial.flush();
+
+  ESP.restart();
+}
+
+// =====================================================
+// UBAH MODE INPUT
+//
+// GOOD -> REWORK -> REJECT -> GOOD
+// =====================================================
+void toggleInputMode()
+{
+  switch (inputMode)
+  {
+    case MODE_GOOD:
+      inputMode = MODE_REWORK;
+      break;
+
+    case MODE_REWORK:
+      inputMode = MODE_REJECT;
+      break;
+
+    case MODE_REJECT:
+    default:
+      inputMode = MODE_GOOD;
+      break;
+  }
+
+  showMessage(
+      "MODE INPUT:",
+      inputModeText()
+  );
+
+  if (inputMode == MODE_GOOD)
+  {
+    beepCode(1);
+  }
+  else
+  {
+    beepCode(2);
+  }
+
+  debugPrint(
+      "Mode input berubah: " +
+      inputModeText()
+  );
+
+  delay(700);
+
+  showReady();
+}
+
+// =====================================================
+// HANDLE TOMBOL
+// =====================================================
+void handleButton()
+{
+  bool reading =
+      digitalRead(BUTTON_PIN);
+
+  unsigned long now =
+      millis();
+
+  if (reading != lastButtonReading)
+  {
+    lastButtonReading = reading;
+    buttonChangedAt = now;
+  }
+
+  if (
+      now - buttonChangedAt <
+      BUTTON_DEBOUNCE_MS
+  )
+  {
+    return;
+  }
+
+  if (reading == stableButtonState)
+  {
+    return;
+  }
+
+  stableButtonState = reading;
+
+  if (stableButtonState != LOW)
+  {
+    return;
+  }
+
+  if (
+      now - lastButtonActionAt <
+      BUTTON_REPEAT_BLOCK_MS
+  )
+  {
+    return;
+  }
+
+  lastButtonActionAt = now;
+
+  // ===================================================
+  // BELUM LOGIN:
+  // tampilkan MAC lalu restart
+  // ===================================================
+  if (!operatorLoggedIn)
+  {
+    displayMacAndRestart();
+    return;
+  }
+
+  // ===================================================
+  // SUDAH LOGIN:
+  // GOOD -> REWORK -> REJECT -> GOOD
+  // ===================================================
+  toggleInputMode();
+}
+
+// =====================================================
+// MAC INVALID
+// =====================================================
+void haltInvalidMac()
+{
+  debugPrint(
+      "FATAL: INVALID MAC ADDRESS"
+  );
+
+  showMessage(
+      "MAC INVALID",
+      "TEKAN TOMBOL"
+  );
+
+  beepCode(3);
+
+  while (true)
+  {
+    /*
+     * Karena belum login, tombol akan menjalankan
+     * displayMacAndRestart().
+     */
+    handleButton();
+
+    delay(2);
+  }
+}
+
+bool ensureValidDeviceId()
+{
+  if (!isInvalidMac(deviceId))
+  {
+    return true;
+  }
+
+  haltInvalidMac();
+
+  return false;
+}
+
+// =====================================================
+// BUILD MQTT TOPIC
+// =====================================================
+void buildTopics()
+{
+  ensureValidDeviceId();
+
+  topicResponse =
+      "quiltdown/response/" +
+      deviceId;
+
+  topicStatus =
+      "quiltdown/status/" +
+      deviceId;
+
+  topicReset =
+      "quiltdown/reset/" +
+      deviceId;
+}
+
+// =====================================================
+// OPTIMASI WIRELESS
+// =====================================================
+void optimizeWireless()
+{
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+
+  esp_wifi_set_ps(
+      WIFI_PS_NONE
+  );
+
+  btStop();
+}
+
+// =====================================================
+// MULAI WIFI
+// =====================================================
+void startWiFi()
+{
+  ensureValidDeviceId();
+
+  debugPrint(
+      "Menyambungkan ke WiFi: " +
+      String(WIFI_SSID)
+  );
+
+  showMessage(
+      "CONNECT WIFI",
+      WIFI_SSID
+  );
+
+  WiFi.disconnect(false);
+
+  delay(50);
+
+  WiFi.mode(WIFI_STA);
+
+  WiFi.begin(
+      WIFI_SSID,
+      WIFI_PASS
+  );
+
+  lastWifiAttempt = millis();
+}
+
+// =====================================================
+// MAINTAIN WIFI
+// =====================================================
+void maintainWiFi()
+{
+  ensureValidDeviceId();
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    if (!wifiWasConnected)
+    {
+      wifiWasConnected = true;
+      mqttWasConnected = false;
+
+      lastMqttAttempt = 0;
+
+      debugPrint(
+          "WiFi connected"
+      );
+
+      debugPrint(
+          "SSID : " +
+          WiFi.SSID()
+      );
+
+      debugPrint(
+          "IP   : " +
+          WiFi.localIP().toString()
+      );
+
+      debugPrint(
+          "RSSI : " +
+          String(WiFi.RSSI())
+      );
+
+      showMessage(
+          "WIFI CONNECTED",
+          WiFi.localIP().toString()
+      );
+
+      beepCode(1);
+    }
+
+    return;
+  }
+
+  if (wifiWasConnected)
+  {
+    wifiWasConnected = false;
+    mqttWasConnected = false;
+
+    mqttClient.disconnect();
+
+    rfidProcessing = false;
+    restoreRequested = false;
+    restoreCompleted = false;
+
+    showMessage(
+        "WIFI LOST",
+        "RECONNECT..."
+    );
+
+    beepCode(3);
+  }
+
+  if (
+      millis() - lastWifiAttempt >=
+      WIFI_RETRY_INTERVAL
+  )
+  {
+    startWiFi();
+  }
+}
+
+// =====================================================
+// PUBLISH RESET INFO
+// =====================================================
+void publishResetInfo()
+{
+  if (!mqttClient.connected())
+  {
+    return;
+  }
+
+  JsonDocument doc;
+
+  doc["mac"]          = deviceId;
+  doc["type"]         = DEVICE_TYPE;
+  doc["bagian"]       = DEVICE_BAGIAN;
+  doc["scan_type"]    = scanType;
+  doc["reset_reason"] = bootResetReason;
+  doc["free_heap"]    = ESP.getFreeHeap();
+  doc["sketch_size"]  = ESP.getSketchSize();
+  doc["flash_size"]   = ESP.getFlashChipSize();
+  doc["cpu_mhz"]      = ESP.getCpuFreqMHz();
+
+  char payload[512];
+
+  size_t payloadLength =
+      serializeJson(
+          doc,
+          payload,
+          sizeof(payload)
+      );
+
+  if (
+      payloadLength == 0 ||
+      payloadLength >= sizeof(payload)
+  )
+  {
+    debugPrint(
+        "Payload reset gagal dibuat"
+    );
+
+    return;
+  }
+
+  mqttClient.publish(
+      topicReset.c_str(),
+      reinterpret_cast<const uint8_t*>(payload),
+      static_cast<unsigned int>(payloadLength),
+      true
+  );
+}
+
+// =====================================================
+// REQUEST ID
+// =====================================================
+String makeRequestId()
+{
+  return
+      deviceId +
+      "-" +
+      String(millis()) +
+      "-" +
+      String(esp_random(), HEX);
+}
+
+// =====================================================
+// REQUEST RESTORE SESSION
+// =====================================================
+bool requestRestoreSession()
+{
+  ensureValidDeviceId();
+
+  if (!mqttClient.connected())
+  {
+    return false;
+  }
+
+  if (restoreRequested)
+  {
+    return false;
+  }
+
+  lastRequestId =
+      makeRequestId();
+
+  JsonDocument doc;
+
+  doc["request_id"] =
+      lastRequestId;
+
+  doc["action"] =
+      "restore_session";
+
+  doc["mac"] =
+      deviceId;
+
+  doc["type"] =
+      DEVICE_TYPE;
+
+  doc["bagian"] =
+      DEVICE_BAGIAN;
+
+  doc["scan_type"] =
+      scanType;
+
+  doc["reset_reason"] =
+      bootResetReason;
+
+  doc["uptime_ms"] =
+      millis();
+
+  doc["rssi"] =
+      WiFi.RSSI();
+
+  char payload[512];
+
+  size_t payloadLength =
+      serializeJson(
+          doc,
+          payload,
+          sizeof(payload)
+      );
+
+  if (
+      payloadLength == 0 ||
+      payloadLength >= sizeof(payload)
+  )
+  {
+    showMessage(
+        "RESTORE ERROR",
+        "JSON GAGAL"
+    );
+
+    return false;
+  }
+
+  bool published =
+      mqttClient.publish(
+          TOPIC_REQUEST,
+          reinterpret_cast<const uint8_t*>(payload),
+          static_cast<unsigned int>(payloadLength),
+          false
+      );
+
+  if (!published)
+  {
+    showMessage(
+        "RESTORE GAGAL",
+        "COBA KEMBALI"
+    );
+
+    return false;
+  }
+
+  restoreRequested = true;
+  restoreCompleted = false;
+  restoreRequestAt = millis();
+
+  showMessage(
+      "CEK LOGIN",
+      "MOHON TUNGGU"
+  );
+
+  debugPrint(
+      "Restore session request:"
+  );
+
+  debugPrint(
+      String(payload)
+  );
+
+  return true;
+}
+
+// =====================================================
+// MAINTAIN MQTT
+// =====================================================
+void maintainMQTT()
+{
+  ensureValidDeviceId();
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    return;
+  }
+
+  if (mqttClient.connected())
+  {
+    return;
+  }
+
+  if (
+      millis() - lastMqttAttempt <
+      MQTT_RETRY_INTERVAL
+  )
+  {
+    return;
+  }
+
+  lastMqttAttempt = millis();
+
+  String clientId =
+      "QUILTDOWN-" +
+      scanType +
+      "-" +
+      deviceId;
+
+  bool connected =
+      mqttClient.connect(
+          clientId.c_str(),
+          topicStatus.c_str(),
+          0,
+          true,
+          "offline"
+      );
+
+  if (!connected)
+  {
+    debugPrint(
+        "MQTT gagal, state=" +
+        String(mqttClient.state())
+    );
+
+    showMessage(
+        "MQTT FAILED",
+        "RETRY..."
+    );
+
+    return;
+  }
+
+  mqttWasConnected = true;
+
+  bool subscribed =
+      mqttClient.subscribe(
+          topicResponse.c_str(),
+          1
+      );
+
+  mqttClient.publish(
+      topicStatus.c_str(),
+      "online",
+      true
+  );
+
+  publishResetInfo();
+
+  debugPrint(
+      "MQTT connected"
+  );
+
+  debugPrint(
+      "Subscribe: " +
+      topicResponse
+  );
+
+  debugPrint(
+      String("Subscribe status: ") +
+      (subscribed ? "SUCCESS" : "FAILED")
+  );
+
+  showMessage(
+      "MQTT SUCCESS",
+      scanType
+  );
+
+  beepCode(1);
+
+  delay(500);
+
+  restoreRequested = false;
+  restoreCompleted = false;
+
+  requestRestoreSession();
+}
+
+// =====================================================
+// PUBLISH SCAN RFID
+// =====================================================
+bool publishSmartRequest(const String& tag)
+{
+  ensureValidDeviceId();
+
+  if (restoreRequested)
+  {
+    showMessage(
+        "CEK LOGIN",
+        "MOHON TUNGGU"
+    );
+
+    return false;
+  }
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    showMessage(
+        "WIFI LOST",
+        "TUNGGU KONEKSI"
+    );
+
+    beepCode(3);
+    scheduleReady();
+
+    return false;
+  }
+
+  if (!mqttClient.connected())
+  {
+    showMessage(
+        "SERVER LOST",
+        "TUNGGU KONEKSI"
+    );
+
+    beepCode(3);
+    scheduleReady();
+
+    return false;
+  }
+
+  lastRequestId =
+      makeRequestId();
+
+  JsonDocument doc;
+
+  doc["request_id"] =
+      lastRequestId;
+
+  doc["action"] =
+      "scan";
+
+  doc["mac"] =
+      deviceId;
+
+  doc["rfid"] =
+      tag;
+
+  doc["type"] =
+      DEVICE_TYPE;
+
+  doc["bagian"] =
+      DEVICE_BAGIAN;
+
+  doc["scan_type"] =
+      scanType;
+
+  doc["input_status"] =
+      inputModeText();
+
+  doc["logged_in"] =
+      operatorLoggedIn;
+
+  doc["operator_rfid"] =
+      activeOperatorRfid;
+
+  doc["operator_name"] =
+      operatorName;
+
+  doc["line"] =
+      operatorLine;
+
+  doc["reset_reason"] =
+      bootResetReason;
+
+  doc["uptime_ms"] =
+      millis();
+
+  doc["rssi"] =
+      WiFi.RSSI();
+
+  char payload[768];
+
+  size_t payloadLength =
+      serializeJson(
+          doc,
+          payload,
+          sizeof(payload)
+      );
+
+  if (
+      payloadLength == 0 ||
+      payloadLength >= sizeof(payload)
+  )
+  {
+    showMessage(
+        "JSON ERROR",
+        "PAYLOAD GAGAL"
+    );
+
+    beepCode(3);
+    scheduleReady();
+
+    return false;
+  }
+
+  bool published =
+      mqttClient.publish(
+          TOPIC_REQUEST,
+          reinterpret_cast<const uint8_t*>(payload),
+          static_cast<unsigned int>(payloadLength),
+          false
+      );
+
+  if (!published)
+  {
+    showMessage(
+        "KIRIM GAGAL",
+        "SCAN ULANG"
+    );
+
+    beepCode(3);
+    scheduleReady();
+
+    return false;
+  }
+
+  rfidProcessing = true;
+  rfidProcessingStart = millis();
+
+  if (!operatorLoggedIn)
+  {
+    showMessage(
+        "CEK USER",
+        tag
+    );
+  }
+  else
+  {
+    showMessage(
+        "SCAN " +
+        inputModeText(),
+        tag
+    );
+  }
+
+  beepCode(1);
+
+  debugPrint(
+      "================================="
+  );
+
+  debugPrint(
+      "MQTT SCAN REQUEST"
+  );
+
+  debugPrint(
+      "Request ID   : " +
+      lastRequestId
+  );
+
+  debugPrint(
+      "RFID         : " +
+      tag
+  );
+
+  debugPrint(
+      "Input Status : " +
+      inputModeText()
+  );
+
+  debugPrint(
+      "Payload      : " +
+      String(payload)
+  );
+
+  debugPrint(
+      "================================="
+  );
+
+  return true;
+}
+
+// =====================================================
+// RESET SESSION LOKAL
+// =====================================================
+void clearLocalSession()
+{
+  operatorLoggedIn = false;
+
+  activeOperatorRfid = "";
+  operatorName       = "NO LOGIN";
+  operatorLine       = "";
+
+  totalGood   = 0;
+  totalRework = 0;
+  totalReject = 0;
+
+  inputMode = MODE_GOOD;
+}
+
+// =====================================================
+// UPDATE SESSION DAN COUNTER
+// =====================================================
+void updateSessionAndCounter(JsonDocument& doc)
+{
+  String code =
+      doc["code"] | "";
+
+  code.trim();
+  code.toUpperCase();
+
+  // ===================================================
+  // RESTORE EMPTY
+  // ===================================================
+  if (code == "RESTORE_EMPTY")
+  {
+    clearLocalSession();
+
+    restoreRequested = false;
+    restoreCompleted = true;
+
+    return;
+  }
+
+  // ===================================================
+  // LOGOUT
+  // ===================================================
+  if (code == "LOGOUT")
+  {
+    clearLocalSession();
+
+    return;
+  }
+
+  // ===================================================
+  // LOGIN / CHANGE USER / RESTORE
+  // ===================================================
+  if (
+      code == "LOGIN" ||
+      code == "CHANGE_USER" ||
+      code == "RESTORE"
+  )
+  {
+    operatorLoggedIn = true;
+
+    activeOperatorRfid =
+        String(
+            doc["user"]["rfid"] | ""
+        );
+
+    operatorName =
+        String(
+            doc["user"]["name"] | ""
+        );
+
+    operatorLine =
+        String(
+            doc["user"]["line"] | ""
+        );
+
+    totalGood =
+        doc["totals"]["good"] | 0;
+
+    totalRework =
+        doc["totals"]["rework"] | 0;
+
+    totalReject =
+        doc["totals"]["reject"] | 0;
+
+    /*
+     * Setelah login, change user, atau restart,
+     * alat kembali ke mode GOOD.
+     */
+    inputMode = MODE_GOOD;
+
+    if (code == "RESTORE")
+    {
+      restoreRequested = false;
+      restoreCompleted = true;
+    }
+
+    return;
+  }
+
+  // ===================================================
+  // GOOD SAVED
+  // ===================================================
+  if (code == "GOOD_SAVED")
+  {
+    totalGood =
+        doc["totals"]["good"] |
+        (totalGood + 1);
+
+    totalRework =
+        doc["totals"]["rework"] |
+        totalRework;
+
+    totalReject =
+        doc["totals"]["reject"] |
+        totalReject;
+
+    return;
+  }
+
+  // ===================================================
+  // REWORK SAVED
+  // ===================================================
+  if (code == "REWORK_SAVED")
+  {
+    totalGood =
+        doc["totals"]["good"] |
+        totalGood;
+
+    totalRework =
+        doc["totals"]["rework"] |
+        (totalRework + 1);
+
+    totalReject =
+        doc["totals"]["reject"] |
+        totalReject;
+
+    return;
+  }
+
+  // ===================================================
+  // REJECT SAVED
+  // ===================================================
+  if (code == "REJECT_SAVED")
+  {
+    totalGood =
+        doc["totals"]["good"] |
+        totalGood;
+
+    totalRework =
+        doc["totals"]["rework"] |
+        totalRework;
+
+    totalReject =
+        doc["totals"]["reject"] |
+        (totalReject + 1);
+
+    return;
+  }
+}
+
+// =====================================================
+// HANDLE RESPONSE BACKEND
+// =====================================================
+void handleBackendResponse(
+    const uint8_t* payload,
+    unsigned int length
+)
+{
+  JsonDocument doc;
+
+  DeserializationError jsonError =
+      deserializeJson(
+          doc,
+          payload,
+          length
+      );
+
+  if (jsonError)
+  {
+    debugPrint(
+        "JSON response error: " +
+        String(jsonError.c_str())
+    );
+
+    rfidProcessing = false;
+    restoreRequested = false;
+
+    showMessage(
+        "RESPON RUSAK",
+        "JSON INVALID"
+    );
+
+    beepCode(3);
+    scheduleReady();
+
+    return;
+  }
+
+  String responseRequestId =
+      doc["request_id"] | "";
+
+  if (
+      responseRequestId.length() > 0 &&
+      responseRequestId != lastRequestId
+  )
+  {
+    debugPrint(
+        "Response diabaikan, request_id berbeda"
+    );
+
+    return;
+  }
+
+  rfidProcessing = false;
+
+  bool ok =
+      doc["ok"] | false;
+
+  String code =
+      doc["code"] | "UNKNOWN";
+
+  String message =
+      doc["message"] | "";
+
+  String name =
+      doc["user"]["name"] | "";
+
+  code.trim();
+  code.toUpperCase();
+
+  debugPrint(
+      "================================="
+  );
+
+  debugPrint(
+      "RESPONSE BACKEND"
+  );
+
+  debugPrint(
+      String("OK      : ") +
+      (ok ? "true" : "false")
+  );
+
+  debugPrint(
+      "Code    : " +
+      code
+  );
+
+  debugPrint(
+      "Message : " +
+      message
+  );
+
+  debugPrint(
+      "================================="
+  );
+
+  // ===================================================
+  // RESPONSE GAGAL
+  // ===================================================
+  if (!ok)
+  {
+    restoreRequested = false;
+
+    if (code == "LOGIN_REQUIRED")
+    {
+      showMessage(
+          "BELUM LOGIN",
+          "TAP USER DULU"
+      );
+    }
+    else if (code == "INVALID_MAC")
+    {
+      showMessage(
+          "MAC INVALID",
+          "TEKAN TOMBOL"
+      );
+    }
+    else if (code == "SESSION_TYPE_MISMATCH")
+    {
+      showMessage(
+          "SESSION BEDA",
+          "LOGIN ULANG"
+      );
+    }
+    else if (code == "SESSION_USER_INVALID")
+    {
+      showMessage(
+          "SESSION ERROR",
+          "USER TDK ADA"
+      );
+    }
+    else if (code == "USER_NOT_FOUND")
+    {
+      showMessage(
+          "KARTU DITOLAK",
+          "USER TDK ADA"
+      );
+    }
+    else if (code == "DUPLICATE_SCAN")
+    {
+      showMessage(
+          "SUDAH DIINPUT",
+          "SCAN DITOLAK"
+      );
+    }
+    else if (code == "INVALID_INPUT_STATUS")
+    {
+      showMessage(
+          "MODE INVALID",
+          inputModeText()
+      );
+    }
+    else if (
+        code == "SERVER_ERROR" ||
+        code == "RESTORE_SERVER_ERROR"
+    )
+    {
+      showMessage(
+          "DATABASE ERROR",
+          "CEK SERVER"
+      );
+    }
+    else
+    {
+      showMessage(
+          "PROSES GAGAL",
+          message
+      );
+    }
+
+    beepCode(3);
+
+    if (code != "INVALID_MAC")
+    {
+      scheduleReady();
+    }
+
+    return;
+  }
+
+  updateSessionAndCounter(doc);
+
+  // ===================================================
+  // RESTORE
+  // ===================================================
+  if (code == "RESTORE")
+  {
+    showMessage(
+        "LOGIN DILANJUT",
+        name
+    );
+
+    beepCode(1);
+
+    delay(1000);
+
+    showReady();
+
+    return;
+  }
+
+  // ===================================================
+  // RESTORE EMPTY
+  // ===================================================
+  if (code == "RESTORE_EMPTY")
+  {
+    showMessage(
+        "BELUM LOGIN",
+        "TAP KARTU USER"
+    );
+
+    beepCode(1);
+
+    delay(700);
+
+    showReady();
+
+    return;
+  }
+
+  // ===================================================
+  // LOGIN
+  // ===================================================
+  if (code == "LOGIN")
+  {
+    showMessage(
+        "LOGIN BERHASIL",
+        name
+    );
+
+    beepCode(1);
+    scheduleReady();
+
+    return;
+  }
+
+  // ===================================================
+  // LOGOUT
+  // ===================================================
+  if (code == "LOGOUT")
+  {
+    showMessage(
+        "LOGOUT BERHASIL",
+        name
+    );
+
+    beepCode(2);
+    scheduleReady();
+
+    return;
+  }
+
+  // ===================================================
+  // CHANGE USER
+  // ===================================================
+  if (code == "CHANGE_USER")
+  {
+    showMessage(
+        "GANTI OPERATOR",
+        name
+    );
+
+    beepCode(2);
+    scheduleReady();
+
+    return;
+  }
+
+  // ===================================================
+  // GOOD SAVED
+  // ===================================================
+  if (code == "GOOD_SAVED")
+  {
+    showMessage(
+        "GOOD TERSIMPAN",
+        "TOTAL=" +
+        String(totalGood)
+    );
+
+    beepCode(1);
+    scheduleReady();
+
+    return;
+  }
+
+  // ===================================================
+  // REWORK SAVED
+  // ===================================================
+  if (code == "REWORK_SAVED")
+  {
+    showMessage(
+        "REWORK SIMPAN",
+        "TOTAL=" +
+        String(totalRework)
+    );
+
+    beepCode(2);
+    scheduleReady();
+
+    return;
+  }
+
+  // ===================================================
+  // REJECT SAVED
+  // ===================================================
+  if (code == "REJECT_SAVED")
+  {
+    showMessage(
+        "REJECT SIMPAN",
+        "TOTAL=" +
+        String(totalReject)
+    );
+
+    beepCode(2);
+    scheduleReady();
+
+    return;
+  }
+
+  showMessage(
+      "BERHASIL",
+      message
+  );
+
+  beepCode(1);
+  scheduleReady();
+}
+
+// =====================================================
+// MQTT CALLBACK
+// =====================================================
+void mqttCallback(
+    char* topic,
+    byte* payload,
+    unsigned int length
+)
+{
+  String incomingTopic =
+      String(topic);
+
+  if (incomingTopic != topicResponse)
+  {
+    return;
+  }
+
+  handleBackendResponse(
+      payload,
+      length
+  );
+}
+
+// =====================================================
+// RFID RDM6300
+// =====================================================
+String readTag(Stream& serial)
+{
+  if (!serial.available())
+  {
+    return "";
+  }
+
+  int firstByte =
+      serial.read();
+
+  if (firstByte != 0x02)
+  {
+    return "";
+  }
+
+  String hexData = "";
+
+  unsigned long start =
+      millis();
+
+  while (
+      millis() - start <
+      100
+  )
+  {
+    if (!serial.available())
+    {
+      delay(1);
+      continue;
+    }
+
+    char value =
+        static_cast<char>(
+            serial.read()
+        );
+
+    if (value == 0x03)
+    {
+      break;
+    }
+
+    hexData += value;
+  }
+
+  if (hexData.length() < 12)
+  {
+    debugPrint(
+        "RFID frame terlalu pendek: " +
+        hexData
+    );
+
+    return "";
+  }
+
+  String tagHex =
+      hexData.substring(0, 10);
+
+  String serialHex =
+      tagHex.substring(2, 10);
+
+  uint64_t tagDecimal =
+      strtoull(
+          serialHex.c_str(),
+          nullptr,
+          16
+      );
+
+  char buffer[20];
+
+  snprintf(
+      buffer,
+      sizeof(buffer),
+      "%010llu",
+      static_cast<unsigned long long>(
+          tagDecimal
+      )
+  );
+
+  return String(buffer);
+}
+
+// =====================================================
+// RFID DEBOUNCE
+// =====================================================
+bool allowRFID(const String& tag)
+{
+  unsigned long now =
+      millis();
+
+  if (
+      tag == lastTag &&
+      now - lastReadTime <
+      RFID_DEBOUNCE_TIME
+  )
+  {
+    lastReadTime = now;
+
+    debugPrint(
+        "RFID duplicate diabaikan: " +
+        tag
+    );
+
+    return false;
+  }
+
+  if (
+      rfidProcessing ||
+      restoreRequested
+  )
+  {
+    lastTag = tag;
+    lastReadTime = now;
+
+    debugPrint(
+        "RFID diabaikan, proses sebelumnya belum selesai"
+    );
+
+    return false;
+  }
+
+  lastTag = tag;
+  lastReadTime = now;
+
+  return true;
+}
+
+// =====================================================
+// PROCESS RFID
+// =====================================================
+void processTag(String tag)
+{
+  ensureValidDeviceId();
+
+  tag.trim();
+
+  if (
+      tag.length() == 0 ||
+      tag.length() > 30
+  )
+  {
+    return;
+  }
+
+  if (!allowRFID(tag))
+  {
+    return;
+  }
+
+  debugPrint(
+      "RFID terbaca: " +
+      tag
+  );
+
+  publishSmartRequest(tag);
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup()
+{
+  Serial.begin(115200);
+
+  delay(300);
+
+  // ===================================================
+  // PIN
+  // ===================================================
+  pinMode(
+      BUTTON_PIN,
+      INPUT_PULLUP
+  );
+
+  pinMode(
+      BUZZER_PIN,
+      OUTPUT
+  );
+
+  digitalWrite(
+      BUZZER_PIN,
+      LOW
+  );
+
+  buzzerBegin();
+
+  // ===================================================
+  // LCD
+  // ===================================================
+  lcd.init();
+  lcd.backlight();
+
+// const char* DEVICE_TYPE   = "out";
+// const char* DEVICE_BAGIAN = "quilting";
+  showMessage(
+      DEVICE_TYPE ,
+      DEVICE_BAGIAN
+  );
+
+  beepCode(1);
+
+  // ===================================================
+  // RFID UART
+  // ===================================================
+  RFID.begin(
+      RFID_BAUD,
+      SERIAL_8N1,
+      RFID_RX_PIN,
+      RFID_TX_PIN
+  );
+
+  // ===================================================
+  // VALIDASI CONFIG
+  // ===================================================
+  if (!validDeviceConfig())
+  {
+    showMessage(
+        "CONFIG ERROR",
+        "TYPE/BAGIAN"
+    );
+
+    beepCode(3);
+
+    while (true)
+    {
+      delay(1000);
+    }
+  }
+
+  scanType =
+      buildScanType();
+
+  // ===================================================
+  // OPTIMASI WIFI
+  // ===================================================
+  optimizeWireless();
+
+  // ===================================================
+  // AMBIL MAC
+  // ===================================================
+  deviceId =
+      getSafeMacAddress();
+
+  if (isInvalidMac(deviceId))
+  {
+    haltInvalidMac();
+  }
+
+  // ===================================================
+  // MAC TAMPIL 1 DETIK SAAT BOOT
+  // ===================================================
+  showMessage(
+      "DEVICE MAC:",
+      deviceId
+  );
+
+  delay(1000);
+
+  // ===================================================
+  // RESET REASON
+  // ===================================================
+  bootResetReason =
+      esp_rst();
+
+  printResetDebug();
+  showResetReasonOnLCD();
+
+  // ===================================================
+  // TOPIK MQTT
+  // ===================================================
+  buildTopics();
+
+  debugPrint(
+      "Device ID      : " +
+      deviceId
+  );
+
+  debugPrint(
+      "Scan Type      : " +
+      scanType
+  );
+
+  debugPrint(
+      "Topic Request  : " +
+      String(TOPIC_REQUEST)
+  );
+
+  debugPrint(
+      "Topic Response : " +
+      topicResponse
+  );
+
+  // ===================================================
+  // MQTT
+  // ===================================================
+  mqttClient.setServer(
+      MQTT_SERVER,
+      MQTT_PORT
+  );
+
+  mqttClient.setCallback(
+      mqttCallback
+  );
+
+  mqttClient.setBufferSize(1536);
+  mqttClient.setKeepAlive(30);
+  mqttClient.setSocketTimeout(5);
+
+  lastWifiAttempt =
+      millis() -
+      WIFI_RETRY_INTERVAL;
+
+  lastMqttAttempt =
+      millis() -
+      MQTT_RETRY_INTERVAL;
+
+  maintainWiFi();
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop()
+{
+  ensureValidDeviceId();
+
+  // ===================================================
+  // TOMBOL
+  // ===================================================
+  handleButton();
+
+  // ===================================================
+  // CONNECTION
+  // ===================================================
+  maintainWiFi();
+  maintainMQTT();
+
+  if (mqttClient.connected())
+  {
+    mqttClient.loop();
+  }
+
+  // ===================================================
+  // RESTORE TIMEOUT
+  // ===================================================
+  if (
+      restoreRequested &&
+      !restoreCompleted &&
+      millis() - restoreRequestAt >=
+      RESTORE_TIMEOUT
+  )
+  {
+    restoreRequested = false;
+    restoreCompleted = false;
+
+    clearLocalSession();
+
+    showMessage(
+        "RESTORE TIMEOUT",
+        "TAP USER ULANG"
+    );
+
+    beepCode(3);
+    scheduleReady();
+  }
+
+  // ===================================================
+  // RFID PROCESSING TIMEOUT
+  // ===================================================
+  if (
+      rfidProcessing &&
+      millis() - rfidProcessingStart >=
+      RFID_PROCESSING_TIMEOUT
+  )
+  {
+    rfidProcessing = false;
+
+    showMessage(
+        "SERVER TIMEOUT",
+        "SCAN ULANG"
+    );
+
+    beepCode(3);
+    scheduleReady();
+  }
+
+  // ===================================================
+  // KEMBALI KE IDLE
+  // ===================================================
+  if (
+      returnToReady &&
+      millis() - returnReadyStart >=
+      READY_RETURN_DELAY
+  )
+  {
+    returnToReady = false;
+
+    showReady();
+  }
+
+  // ===================================================
+  // HEARTBEAT
+  // ===================================================
+  if (
+      mqttClient.connected() &&
+      millis() - lastHeartbeat >=
+      HEARTBEAT_INTERVAL
+  )
+  {
+    lastHeartbeat = millis();
+
+    mqttClient.publish(
+        topicStatus.c_str(),
+        "online",
+        true
+    );
+  }
+
+  // ===================================================
+  // BACA RFID
+  // ===================================================
+  String tag =
+      readTag(RFID);
+
+  if (tag.length() > 0)
+  {
+    processTag(tag);
+  }
+
+  delay(2);
+}

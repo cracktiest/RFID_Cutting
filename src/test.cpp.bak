@@ -1,0 +1,454 @@
+#include <Arduino.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include "esp_wifi.h"
+
+// ================= WIFI =================
+const char* ssid = "Robot_Resource (Lokal)";
+const char* password = "robot@9876";
+const char* mqtt_server = "10.5.0.107";
+
+// ================= RFID =================
+#define RFID_RX_PIN 16
+#define RFID_TX_PIN 17
+
+// ================= BUZZER =================
+#define BUZZER_PIN 33
+
+// ================= LCD =================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ================= MQTT =================
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ================= RFID UART =================
+HardwareSerial RFID(2);
+
+// ================= DEVICE =================
+String deviceId;
+
+String topicTag;
+String topicStatus;
+String topicNama;
+String topicLine;
+
+// ================= USER DATA =================
+String nama = "";
+String line = "";
+
+// ================= DEBOUNCE =================
+String lastTag = "";
+unsigned long lastReadTime = 0;
+const unsigned long debounceTime = 1500;
+
+// ================= HEARTBEAT =================
+unsigned long lastHeartbeat = 0;
+const unsigned long heartbeatInterval = 5000;
+
+// ================= DEBUG =================
+bool debugMode = true;
+
+void debugPrint(String msg)
+{
+  if(debugMode)
+    Serial.println(msg);
+}
+
+// ================= BUZZER =================
+void beep(int duration = 200)
+{
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(duration);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// ================= LCD USER =================
+void showUser()
+{
+  if(nama.length() == 0)
+    return;
+
+  lcd.clear();
+
+  lcd.setCursor(0,0);
+
+  if(nama.length() > 16)
+    lcd.print(nama.substring(0,16));
+  else
+    lcd.print(nama);
+
+  lcd.setCursor(0,1);
+  lcd.print("LINE:");
+  lcd.print(line);
+
+  beep(300);
+}
+
+void showTapRFID(){
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("RFID READY");
+  lcd.setCursor(0,1);
+  lcd.print("TAP KARTU");
+  beep(100);
+}
+
+// ================= MQTT CALLBACK =================
+void callback(
+  char* topic,
+  byte* payload,  
+  unsigned int length
+)
+{
+  String msg = "";
+
+  for(unsigned int i=0;i<length;i++)
+  {
+    msg += (char)payload[i];
+  }
+
+  String topicStr = String(topic);
+
+  debugPrint("RX : " + topicStr + " = " + msg);
+if(topicStr == topicNama)
+{
+  nama = msg;
+
+  // logout
+  if(nama.length() == 0)
+  {
+    line = "";
+    showTapRFID();
+    return;
+  }
+
+  showUser();
+}
+
+  else if(topicStr == topicLine)
+  {
+    line = msg;
+
+    // tampilkan user hanya jika nama ada
+    if(nama.length() > 0)
+    {
+      showUser();
+    }
+  }
+}
+
+// ================= MQTT RECONNECT =================
+void reconnectMQTT()
+{
+  while(!client.connected())
+  {
+    debugPrint("Connecting MQTT...");
+
+    String clientId =
+      "ESP32-" + deviceId;
+
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print("MQTT CONNECT TO");
+    lcd.setCursor(0,1);
+    lcd.print(mqtt_server);
+
+    if(
+      client.connect(
+        clientId.c_str(),
+        topicStatus.c_str(),
+        0,
+        true,
+        "offline"
+      )
+    )
+    {
+      debugPrint("MQTT Connected");
+
+      client.subscribe(topicNama.c_str());
+      client.subscribe(topicLine.c_str());
+
+      client.publish(
+        topicStatus.c_str(),
+        "online",
+        true
+      );
+
+      lcd.clear();
+      lcd.setCursor(0,0);
+      lcd.print("MQTT SUCCESS");
+      lcd.setCursor(0,1);
+      lcd.print(mqtt_server);
+      delay(1000);
+      
+      if(nama.length() == 0)
+      {
+        line = "";
+        showTapRFID();
+        return;
+      }
+    }
+    else
+    {
+      debugPrint("MQTT Failed");
+
+      lcd.clear();
+      lcd.setCursor(0,0);
+      lcd.print("MQTT FAILED");
+
+      delay(2000);
+    }
+  }
+}
+
+// ================= RFID READER =================
+String readTag(Stream& serial)
+{
+  if(!serial.available())
+    return "";
+
+  if(serial.read() != 0x02)
+    return "";
+
+  String hexData = "";
+
+  unsigned long start = millis();
+
+  while(millis() - start < 100)
+  {
+    if(serial.available())
+    {
+      char c = serial.read();
+
+      if(c == 0x03)
+        break;
+
+      hexData += c;
+    }
+  }
+
+  if(hexData.length() < 12)
+    return "";
+
+  String tagHex =
+    hexData.substring(0,10);
+
+  String serialHex =
+    tagHex.substring(2,10);
+
+  uint64_t tagDec =
+    strtoull(
+      serialHex.c_str(),
+      NULL,
+      16
+    );
+
+  char buffer[20];
+
+  snprintf(
+    buffer,
+    sizeof(buffer),
+    "%010llu",
+    (unsigned long long)tagDec
+  );
+
+  return String(buffer);
+}
+
+// ================= SETUP =================
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  RFID.begin(
+    9600,
+    SERIAL_8N1,
+    RFID_RX_PIN,
+    RFID_TX_PIN
+  );
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("CONNECT WIFI");
+  lcd.setCursor(0,1);
+  lcd.print(ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid,password);
+  WiFi.setSleep(false);
+
+  while(WiFi.status()!=WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+
+  esp_wifi_set_protocol(
+    WIFI_IF_STA,
+    WIFI_PROTOCOL_11B
+  );
+
+  esp_wifi_set_bandwidth(
+    WIFI_IF_STA,
+    WIFI_BW_HT20
+  );
+
+  // ================= DEVICE ID =================
+
+  deviceId = WiFi.macAddress();
+
+  deviceId.replace(":","");
+  deviceId.toUpperCase();
+
+  debugPrint("Device ID : " + deviceId);
+  
+  showTapRFID();
+  // ================= TOPIC =================
+
+  topicTag =
+    "rfid/batch/" +
+    deviceId +
+    "/tag";
+
+  topicStatus =
+    "rfid/batch/" +
+    deviceId +
+    "/status";
+
+  topicNama =
+    "rfid/batch/" +
+    deviceId +
+    "/nama";
+
+  topicLine =
+    "rfid/batch/" +
+    deviceId +
+    "/line";
+
+  debugPrint(topicTag);
+  debugPrint(topicNama);
+  debugPrint(topicLine);
+
+  // ================= MQTT =================
+
+  client.setServer(
+    mqtt_server,
+    1883
+  );
+
+  client.setCallback(callback);
+
+  reconnectMQTT();
+
+  // lcd.clear();
+  // lcd.setCursor(0,0);
+  // lcd.print("RFID READY");
+
+  // lcd.setCursor(0,1);
+  // lcd.print("TAP KARTU");
+}
+
+// ================= LOOP =================
+void loop()
+{
+  if(!client.connected())
+  {
+    reconnectMQTT();
+  }
+
+  client.loop();
+
+  // ================= HEARTBEAT =================
+
+  if(
+    millis() - lastHeartbeat
+    >= heartbeatInterval
+  )
+  {
+    lastHeartbeat = millis();
+
+    client.publish(
+      topicStatus.c_str(),
+      "online",
+      true
+    );
+  }
+
+  // ================= RFID =================
+
+  String tag =
+    readTag(RFID);
+
+  if(tag.length() > 0)
+  {
+    unsigned long now = millis();
+
+    bool sameTag =
+      (tag == lastTag);
+
+    bool debounce =
+      (
+        now - lastReadTime
+        <
+        debounceTime
+      );
+
+    if(
+      sameTag &&
+      debounce
+    )
+    {
+      return;
+    }
+
+    lastTag = tag;
+    lastReadTime = now;
+
+    nama = "";
+    line = "";
+
+    String payload =
+      tag +
+      "/" +
+      deviceId;
+
+    debugPrint(
+      "Publish : " + payload
+    );
+
+    client.publish(
+      topicTag.c_str(),
+      payload.c_str()
+    );
+
+    lcd.clear();
+
+    lcd.setCursor(0,0);
+    lcd.print("SCAN RFID");
+
+    lcd.setCursor(0,1);
+    lcd.print(tag);
+
+    beep(150);
+    // lcd.setCursor(0,1);
+    // lcd.print(nama.)
+    // if(nama.length() == 0)
+    // {
+    //   // line = "";
+    //   showTapRFID();
+    //   return;
+    // }
+    
+    if(nama.length() > 0)
+    {
+      showUser();
+    }
+  }
+}
