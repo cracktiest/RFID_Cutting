@@ -5,6 +5,7 @@
 #include <Preferences.h>
 #include "esp_bt.h"
 #include "esp_wifi.h"
+#include "esp_mac.h"
 
 #if __has_include(<esp_arduino_version.h>)
 #include <esp_arduino_version.h>
@@ -1378,6 +1379,36 @@ void handleButton()
 }
 
 // =====================================================
+// MAC ADDRESS WIFI STA (ESP-IDF)
+// Ambil MAC dari eFuse tanpa bergantung pada status koneksi WiFi.
+// =====================================================
+bool initDeviceMac()
+{
+  uint8_t mac[6] = {0};
+  esp_err_t result = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+
+  if (result != ESP_OK)
+  {
+    debugPrint("[MAC] esp_read_mac FAILED, error=" + String((int)result));
+    return false;
+  }
+
+  char macText[13];
+  snprintf(macText, sizeof(macText), "%02X%02X%02X%02X%02X%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  deviceId = String(macText);
+
+  if (deviceId == "000000000000" || deviceId.length() != 12)
+  {
+    debugPrint("[MAC] INVALID: " + deviceId);
+    return false;
+  }
+
+  debugPrint("[MAC] WIFI_STA: " + deviceId);
+  return true;
+}
+
+// =====================================================
 // SETUP
 // =====================================================
 void setup()
@@ -1409,9 +1440,16 @@ void setup()
 
   optimizeWireless();
 
-  deviceId = WiFi.macAddress();
-  deviceId.replace(":", "");
-  deviceId.toUpperCase();
+  // MAC dipakai untuk MQTT client ID, topic dan payload restore/tag.
+  // Jangan lanjut jika MAC invalid agar backend tidak menerima 000000000000.
+  if (!initDeviceMac())
+  {
+    showMessage("MAC ERROR", "CHECK ESP32", 3);
+    while (true)
+    {
+      delay(1000);
+    }
+  }
 
   buildTopics();
 
